@@ -229,6 +229,7 @@ async def camera_loop():
                 is_closed=ear<ear_thresh
 
                 nose_xy=_pt(lms,NOSE_TIP_IDX,w,h)
+                cv2.circle(frame, (int(nose_xy[0]), int(nose_xy[1])), 4, (0,255,0), -1)
 
                 frame_center_x=w/2
                 face_error=(nose_xy[0]-frame_center_x)/frame_center_x
