@@ -14,40 +14,47 @@ Run:
 Quit: press 'q' in the OpenCV window or terminate the program in terminal using Ctrl-C
 """
 
+"""
+Run:
+  Terminal 1:
+  uvicorn fusion_server:app --host 127.0.0.1 --port 8000 --reload
+
+  Terminal 2:
+  python camera_client.py
+"""
+
 import asyncio
 import json
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Deque, Optional, Tuple
+from typing import Deque, Tuple
 
 import cv2
 import mediapipe as mp
 import numpy as np
 import websockets
-import requests 
+import requests
 
 stress_score = 0.0
+stress_state = "normal"
+
 
 WS_URL = "ws://127.0.0.1:8000/ws"
 SEND_HZ = 1.0
 WINDOW_SEC = 15.0
-MIN_FACE_CONF = 0.5
-MIN_TRACK_CONF = 0.5
 
 CAM_WIDTH = 640
 CAM_HEIGHT = 480
 CAMERA_INDEX = 0
 CAP_BACKEND = cv2.CAP_AVFOUNDATION
 
-BASELINE_SEC = 15.0
+MIN_FACE_CONF = 0.5
+MIN_TRACK_CONF = 0.5
 
 EAR_BASELINE_SEC = 2.0
 EAR_THRESH_FRAC = 0.75
 EAR_FALLBACK_THRESH = 0.21
-
-PUPIL_OPEN_MARGIN = 0.02
-PUPIL_MEDIAN_N = 5
 
 ESP32_SERVO_URL = "http://10.48.126.77/servo"
 
@@ -59,6 +66,7 @@ SERVO_SEND_HZ = 10
 servo_filtered = 0.0
 last_servo_send = 0.0
 
+
 def send_servo_command(speed):
     try:
         requests.get(
@@ -69,7 +77,13 @@ def send_servo_command(speed):
     except:
         pass
 
-last_valid_eye_metrics = None
+def stress_color(state: str):
+    if state == "calm":
+        return (0, 255, 120)
+    elif state == "stressed":
+        return (0, 80, 255)
+    else:
+        return (0, 200, 255)
 
 L_EYE = {"p1":33,"p4":133,"p2":160,"p6":144,"p3":158,"p5":153}
 R_EYE = {"p1":362,"p4":263,"p2":387,"p6":373,"p3":385,"p5":380}
@@ -78,9 +92,13 @@ NOSE_TIP_IDX = 1
 LEFT_EYE_OUTER = 33
 RIGHT_EYE_OUTER = 362
 
+last_valid_eye_metrics = None
+
+
 def _pt(landmarks, idx, w, h):
     lm = landmarks[idx]
     return np.array([lm.x*w, lm.y*h], dtype=np.float32)
+
 
 def ear_from_eye(landmarks, eye_idx_map, w, h):
     p1=_pt(landmarks,eye_idx_map["p1"],w,h)
@@ -100,34 +118,40 @@ class WindowStats:
     samples:Deque[Tuple[float,bool,int,float]]
     def __init__(self):
         self.samples=deque()
+
     def prune(self,now,window_sec):
         while self.samples and (now-self.samples[0][0]>window_sec):
             self.samples.popleft()
+
     def add(self,ts,is_closed,blink_event,motion_norm):
         self.samples.append((ts,is_closed,blink_event,motion_norm))
+
     def blink_rate_per_min(self):
         if len(self.samples)<2:return 0.0
         t0=self.samples[0][0];t1=self.samples[-1][0]
         dt=max(1e-6,t1-t0)
         blinks=sum(s[2] for s in self.samples)
         return float(blinks*60.0/dt)
+
     def perclos(self):
         if not self.samples:return 0.0
         closed=sum(1 for s in self.samples if s[1])
         return float(closed/len(self.samples))
+
     def head_motion_var(self):
         if len(self.samples)<3:return 0.0
         m=np.array([s[3] for s in self.samples],dtype=np.float32)
         return float(np.var(m))
 
 async def receive_loop(ws):
-    global stress_score
+    global stress_score, stress_state
     while True:
         try:
             raw=await ws.recv()
             msg=json.loads(raw)
             if msg.get("type")=="stress_score":
                 stress_score=msg.get("value",0.0)
+                stress_state=msg.get("state","normal")
         except:
             break
 
@@ -135,9 +159,6 @@ async def camera_loop():
     global servo_filtered,last_servo_send,last_valid_eye_metrics
 
     cap=cv2.VideoCapture(CAMERA_INDEX,CAP_BACKEND)
-    if not cap.isOpened():
-        raise RuntimeError("Camera failed to open.")
-
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,CAM_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT,CAM_HEIGHT)
 
@@ -213,10 +234,9 @@ async def camera_loop():
 
                 target_speed=SERVO_GAIN*face_error
                 servo_filtered=SERVO_ALPHA*target_speed+(1-SERVO_ALPHA)*servo_filtered
-                servo_speed=servo_filtered
 
                 if face_error!=0.0 and (now-last_servo_send)>(1.0/SERVO_SEND_HZ):
-                    send_servo_command(servo_speed)
+                    send_servo_command(servo_filtered)
                     last_servo_send=now
 
                 l_outer=_pt(lms,LEFT_EYE_OUTER,w,h)
@@ -235,7 +255,6 @@ async def camera_loop():
                 was_closed=is_closed
 
                 win.add(now,is_closed,blink_event,motion_norm)
-                cv2.circle(frame,(int(nose_xy[0]),int(nose_xy[1])),3,(0,255,0),-1)
 
             else:
                 blink_armed=False
@@ -265,13 +284,20 @@ async def camera_loop():
                 last_valid_eye_metrics=current_eye_metrics
 
             send_metrics=last_valid_eye_metrics if last_valid_eye_metrics else current_eye_metrics
+            
+            color = stress_color(stress_state)
 
             cv2.putText(frame,"STRESS",(20,35),
                         cv2.FONT_HERSHEY_DUPLEX,0.5,(200,200,200),1)
+
             cv2.putText(frame,f"{stress_score:.0f}",(20,70),
-                        cv2.FONT_HERSHEY_DUPLEX,1.1,(0,255,120),2)
+                        cv2.FONT_HERSHEY_DUPLEX,1.3,color,3)
+
+            cv2.putText(frame,stress_state.upper(),(20,110),
+                        cv2.FONT_HERSHEY_DUPLEX,0.7,color,2)
 
             cv2.imshow("camera_client",frame)
+
             if cv2.waitKey(1)&0xFF==ord("q"):
                 break
 
@@ -288,6 +314,7 @@ async def camera_loop():
 
     cap.release()
     cv2.destroyAllWindows()
+
 
 if __name__=="__main__":
     asyncio.run(camera_loop())

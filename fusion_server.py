@@ -5,7 +5,6 @@ import uvicorn
 
 app = FastAPI()
 
-
 class FusionState:
     def __init__(self):
         self.eye_metrics = None
@@ -14,6 +13,18 @@ class FusionState:
 
 state = FusionState()
 clients = set()
+
+def stress_label(score: float) -> str:
+    """
+    Convert numeric stress score into human-readable state.
+    Tuned to your current scoring scale.
+    """
+    if score < 40:
+        return "calm"
+    elif score < 70:
+        return "normal"
+    else:
+        return "stressed"
 
 def fuse(state: FusionState) -> float:
     """
@@ -47,7 +58,9 @@ def fuse(state: FusionState) -> float:
     eye_effect += (blink_diff ** 1.3) * 0.07
     eye_effect += perclos * 32.0
     eye_effect += pupil_delta * 18.0
+
     keyboard_effect = kb_score * 10.0
+
     stress = 50.0 + eye_effect + keyboard_effect
 
     if not face_detected:
@@ -105,17 +118,19 @@ async def websocket_endpoint(ws: WebSocket):
                         pass
 
             stress_score = fuse(state)
+            label = stress_label(stress_score)
 
             payload = {
                 "type": "stress_score",
-                "value": stress_score
+                "value": stress_score,
+                "state": label,  
             }
 
             print("\n--- UPDATE ---")
             print("source:", msg_type)
             print("eye_metrics:", "OK" if state.eye_metrics else None)
             print("keyboard_load:", state.keyboard_load)
-            print("stress_score:", round(stress_score, 1))
+            print("stress_score:", round(stress_score, 1), "| state:", label)
 
             await broadcast(payload)
 
