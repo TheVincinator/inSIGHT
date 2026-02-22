@@ -467,7 +467,21 @@ def start_monitoring():
         on_press=on_key_press,
         on_release=on_key_release
     )
-    _mouse_listener = mouse.Listener(
+    _mouse_listener = mouse.Listener
+
+def start_monitoring():
+    """
+    Starts keyboard + mouse listeners WITHOUT launching the rolling monitor UI.
+    This allows other scripts (run.py) to use the load score API.
+    """
+    global keyboard_listener, mouse_listener
+
+    keyboard_listener = keyboard.Listener(
+        on_press=on_key_press,
+        on_release=on_key_release
+    )
+
+    mouse_listener = mouse.Listener(
         on_move=on_move,
         on_click=on_click,
         on_scroll=on_scroll
@@ -488,6 +502,10 @@ def stop_monitoring():
     _keyboard_listener = None
     _mouse_listener = None
 
+    keyboard_listener.start()
+    mouse_listener.start()
+
+    print("[activity_client] monitoring started")
 
 # =========================
 # ENTRY POINT

@@ -258,7 +258,7 @@ async def receive_loop(ws):
 
 async def camera_loop():
     # Setup camera
-    cap = cv2.VideoCapture(ESP32_STREAM)
+    cap = cv2.VideoCapture(CAMERA_INDEX, CAP_BACKEND)
     if not cap.isOpened():
         raise RuntimeError(
             f"Could not open webcam (index {CAMERA_INDEX}). "
