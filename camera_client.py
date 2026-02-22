@@ -7,6 +7,7 @@ Run:
 
   # Terminal 2
   source venv311/bin/activate
+  make sure you're on python 3.11
   pip install mediapipe==0.10.14 opencv-python numpy websockets pynput requests
   python camera_client.py
 
