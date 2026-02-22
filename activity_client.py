@@ -449,6 +449,46 @@ def rolling_monitor():
         else:
             print("\n✓  Normal load.")
 
+
+# =========================
+# START / STOP API
+# =========================
+
+_keyboard_listener = None
+_mouse_listener = None
+
+def start_monitoring():
+    global _keyboard_listener, _mouse_listener
+
+    if _keyboard_listener is not None:
+        return  # already started
+
+    _keyboard_listener = keyboard.Listener(
+        on_press=on_key_press,
+        on_release=on_key_release
+    )
+    _mouse_listener = mouse.Listener(
+        on_move=on_move,
+        on_click=on_click,
+        on_scroll=on_scroll
+    )
+
+    _keyboard_listener.start()
+    _mouse_listener.start()
+
+
+def stop_monitoring():
+    global _keyboard_listener, _mouse_listener
+
+    if _keyboard_listener:
+        _keyboard_listener.stop()
+    if _mouse_listener:
+        _mouse_listener.stop()
+
+    _keyboard_listener = None
+    _mouse_listener = None
+
+
 # =========================
 # ENTRY POINT
 # =========================
@@ -466,15 +506,11 @@ if __name__ == "__main__":
     print(f"  Features         : {len(FEATURE_COLS)}")
     print("=" * 56 + "\n")
 
-    keyboard_listener = keyboard.Listener(on_press=on_key_press, on_release=on_key_release)
-    mouse_listener    = mouse.Listener(on_move=on_move, on_click=on_click, on_scroll=on_scroll)
-    keyboard_listener.start()
-    mouse_listener.start()
+    start_monitoring()
 
     try:
         rolling_monitor()
     except KeyboardInterrupt:
         print("\nStopping…")
     finally:
-        keyboard_listener.stop()
-        mouse_listener.stop()
+        stop_monitoring()
