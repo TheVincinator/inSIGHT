@@ -11,6 +11,10 @@ Run:
   pip install mediapipe==0.10.14 opencv-python numpy websockets pynput requests
   python camera_client.py
 
+  # Terminal 3
+  source venv311/bin/activate
+  python run.py
+
 Quit: press 'q' in the OpenCV window or terminate the program in terminal using Ctrl-C
 """
 
@@ -284,7 +288,7 @@ async def camera_loop():
                 last_valid_eye_metrics=current_eye_metrics
 
             send_metrics=last_valid_eye_metrics if last_valid_eye_metrics else current_eye_metrics
-            
+
             color = stress_color(stress_state)
 
             cv2.putText(frame,"STRESS",(20,35),
