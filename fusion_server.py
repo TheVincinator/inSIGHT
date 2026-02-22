@@ -1,4 +1,4 @@
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 import json
 import time
 
@@ -28,7 +28,7 @@ def compute_stress_simple():
 
     # Very rough demo scoring; tune later
     score = 0.0
-    score += max(0.0, (blink - 15.0) / 15.0)      # above ~15 blinks/min adds
+    score += max(0.0, (blink - 25.0) / 20.0)     # above ~25 blinks/min adds
     score += perclos * 2.0                        # 0..1 scaled up
     score += min(2.0, headv * 10.0)               # depends on camera scale
 
@@ -37,17 +37,27 @@ def compute_stress_simple():
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
-    while True:
-        data = await ws.receive_text()
-        msg = json.loads(data)
+    try:
+        while True:
+            data = await ws.receive_text()
+            msg = json.loads(data)
 
-        mtype = msg.get("type")
-        value = msg.get("value")
+            mtype = msg.get("type")
+            value = msg.get("value")
 
-        state[mtype] = value
-        state["last_update"] = time.time()
+            state[mtype] = value
+            state["last_update"] = time.time()
 
-        stress = compute_stress_simple()
-        print("\n--- UPDATE ---")
-        print("eye_metrics:", state["eye_metrics"])
-        print("stress_score:", stress)
+            stress = compute_stress_simple()
+
+            print("\n--- UPDATE ---")
+            print("eye_metrics:", state["eye_metrics"])
+            print("stress_score:", stress)
+
+            # SEND BACK TO CLIENT
+            await ws.send_text(json.dumps({
+                "type": "stress_score",
+                "value": stress
+            }))
+    except WebSocketDisconnect:
+        print("Client disconnected cleanly")

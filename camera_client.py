@@ -17,12 +17,16 @@ Requires (inside your venv311):
 
 Run:
   # Terminal 1
+  source venv311/bin/activate
+  pip install fastapi uvicorn
   uvicorn fusion_server:app --host 127.0.0.1 --port 8000 --reload
 
   # Terminal 2
+  source venv311/bin/activate
+  pip install mediapipe==0.10.14 opencv-python numpy websockets pynput
   python camera_client.py
 
-Quit: press 'q' in the OpenCV window.
+Quit: press 'q' in the OpenCV window or terminate the program in terminal using Ctrl-C
 """
 
 import asyncio
@@ -36,6 +40,8 @@ import cv2
 import mediapipe as mp
 import numpy as np
 import websockets
+
+stress_score = 0.0
 
 # ----------------------------
 # Tunables
@@ -69,6 +75,8 @@ EAR_FALLBACK_THRESH = 0.21   # used until baseline is ready
 # ---- Pupil stability ----
 PUPIL_OPEN_MARGIN = 0.02     # only compute pupil when ear > (ear_thresh + margin)
 PUPIL_MEDIAN_N = 5           # median filter window for pupil_ratio
+
+ESP32_STREAM = "http://10.48.126.77:81/stream"
 
 # ----------------------------
 # MediaPipe FaceMesh landmark indices
@@ -232,11 +240,25 @@ class WindowStats:
             return 0.0
         m = np.array([s[3] for s in self.samples], dtype=np.float32)
         return float(np.var(m))
+    
+async def receive_loop(ws):
+    global stress_score
+
+    while True:
+        try:
+            raw = await ws.recv()
+            msg = json.loads(raw)
+
+            if msg.get("type") == "stress_score":
+                stress_score = msg.get("value", 0.0)
+
+        except Exception:
+            break
 
 
 async def camera_loop():
     # Setup camera
-    cap = cv2.VideoCapture(CAMERA_INDEX, CAP_BACKEND)
+    cap = cv2.VideoCapture(ESP32_STREAM)
     if not cap.isOpened():
         raise RuntimeError(
             f"Could not open webcam (index {CAMERA_INDEX}). "
@@ -281,6 +303,7 @@ async def camera_loop():
 
     # Connect to server (if server isn't running, this will error)
     async with websockets.connect(WS_URL) as ws:
+        recv_task = asyncio.create_task(receive_loop(ws))
         while True:
             ok, frame = cap.read()
             if not ok or frame is None:
@@ -392,15 +415,15 @@ async def camera_loop():
                 win.add(now, is_closed, blink_event, motion_norm)
 
                 # Overlay
-                cv2.putText(
-                    frame,
-                    f"EAR: {ear:.3f}  thr:{ear_thresh:.3f}  closed={int(is_closed)}",
-                    (10, 25),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (255, 255, 255),
-                    2,
-                )
+                # cv2.putText(
+                #     frame,
+                #     f"EAR: {ear:.3f}  thr:{ear_thresh:.3f}  closed={int(is_closed)}",
+                #     (10, 25),
+                #     cv2.FONT_HERSHEY_DUPLEX,
+                #     0.7,
+                #     (255, 255, 255),
+                #     2,
+                # )
                 cv2.circle(frame, (int(nose_xy[0]), int(nose_xy[1])), 3, (0, 255, 0), -1)
 
             else:
@@ -426,56 +449,80 @@ async def camera_loop():
             head_var = win.head_motion_var()
 
             # Overlays (always show)
-            cv2.putText(
-                frame,
-                f"Blink/min({int(WINDOW_SEC)}s): {blink_rate:.1f}",
-                (10, 55),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (255, 255, 255),
-                2,
-            )
-            cv2.putText(
-                frame,
-                f"PERCLOS({int(WINDOW_SEC)}s): {perclos:.2f}",
-                (10, 85),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (255, 255, 255),
-                2,
-            )
-            cv2.putText(
-                frame,
-                f"HeadVarNorm({int(WINDOW_SEC)}s): {head_var:.4f}",
-                (10, 115),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (255, 255, 255),
-                2,
-            )
+            # cv2.putText(
+            #     frame,
+            #     f"Blink/min({int(WINDOW_SEC)}s): {blink_rate:.1f}",
+            #     (10, 55),
+            #     cv2.FONT_HERSHEY_DUPLEX,
+            #     0.7,
+            #     (255, 255, 255),
+            #     2,
+            # )
+            # cv2.putText(
+            #     frame,
+            #     f"PERCLOS({int(WINDOW_SEC)}s): {perclos:.2f}",
+            #     (10, 85),
+            #     cv2.FONT_HERSHEY_DUPLEX,
+            #     0.7,
+            #     (255, 255, 255),
+            #     2,
+            # )
+            # cv2.putText(
+            #     frame,
+            #     f"HeadVarNorm({int(WINDOW_SEC)}s): {head_var:.4f}",
+            #     (10, 115),
+            #     cv2.FONT_HERSHEY_DUPLEX,
+            #     0.7,
+            #     (255, 255, 255),
+            #     2,
+            # )
 
             # Pupil overlays (if available)
-            if pupil_ratio is not None:
-                base_str = "None" if pupil_baseline is None else f"{pupil_baseline:.4f}"
-                cv2.putText(
-                    frame,
-                    f"PupilRatio: {pupil_ratio:.4f}  Base: {base_str}",
-                    (10, 145),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (255, 255, 255),
-                    2,
-                )
-            if pupil_delta is not None:
-                cv2.putText(
-                    frame,
-                    f"PupilDelta: {pupil_delta:+.4f}",
-                    (10, 175),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (255, 255, 255),
-                    2,
-                )
+            # if pupil_ratio is not None:
+            #     base_str = "None" if pupil_baseline is None else f"{pupil_baseline:.4f}"
+            #     # cv2.putText(
+            #     #     frame,
+            #     #     f"PupilRatio: {pupil_ratio:.4f}  Base: {base_str}",
+            #     #     (10, 145),
+            #     #     cv2.FONT_HERSHEY_DUPLEX,
+            #     #     0.7,
+            #     #     (255, 255, 255),
+            #     #     2,
+            #     # )
+            # if pupil_delta is not None:
+            #     # cv2.putText(
+            #     #     frame,
+            #     #     f"PupilDelta: {pupil_delta:+.4f}",
+            #     #     (10, 175),
+            #     #     cv2.FONT_HERSHEY_DUPLEX,
+            #     #     0.7,
+            #     #     (255, 255, 255),
+            #     #     2,
+            #     # )
+
+            # --- Stress Score UI ---
+            label = "STRESS"
+            value = f"{stress_score:.0f}"
+
+            cv2.putText(
+                frame,
+                label,
+                (20, 35),
+                cv2.FONT_HERSHEY_DUPLEX,
+                0.5,
+                (200, 200, 200),
+                1,
+            )
+
+            cv2.putText(
+                frame,
+                value,
+                (20, 70),
+                cv2.FONT_HERSHEY_DUPLEX,
+                1.1,
+                (0, 255, 120),
+                2,
+            )
 
             cv2.imshow("camera_client (CV features)", frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
