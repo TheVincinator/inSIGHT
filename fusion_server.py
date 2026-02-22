@@ -1,154 +1,189 @@
-from fastapi import FastAPI, WebSocket
+import asyncio
+import json
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 import uvicorn
-import math
+
+# ============================================================
+# GLOBAL APP
+# ============================================================
 
 app = FastAPI()
 
 # ============================================================
-# GLOBAL STATE
+# SHARED STATE
 # ============================================================
 
-state = {
-    "eye_metrics": None,
-    "keyboard_load": None,
-}
+class FusionState:
+    def __init__(self):
+        self.eye_metrics = None
+        self.keyboard_load = None
+        self.smoothed_stress = 50.0  # persistent smoothing
 
-
-# ============================================================
-# HELPERS
-# ============================================================
-
-def _clamp(x, lo, hi):
-    return max(lo, min(hi, x))
-
-
-def _clamp01(x):
-    return _clamp(x, 0.0, 1.0)
-
+state = FusionState()
+clients = set()
 
 # ============================================================
-# FUSION LOGIC
+# SMART HUMAN-CALIBRATED FUSION
 # ============================================================
 
-def compute_eye_score(eye):
-    if not eye:
-        return 35.0
+def fuse(state: FusionState) -> float:
+    """
+    Human-calibrated stress fusion.
 
-    blink = eye.get("blink_rate_per_min", 0) or 0
-    perclos = eye.get("perclos", 0) or 0
-    motion = eye.get("head_motion_var", 0) or 0
-    pupil_delta = eye.get("pupil_delta", 0) or 0
+    Eye metrics ≈ dominant signal (~70%)
+    Keyboard ≈ stabilizer (~30%)
 
-    # Normalize signals (tuned for your ranges)
-    blink_n = _clamp01(blink / 120.0)
-    perclos_n = _clamp01(perclos / 0.5)
-    motion_n = _clamp01(motion / 0.002)
-    pupil_n = _clamp01(abs(pupil_delta) / 0.1)
+    Designed to feel natural rather than linear.
+    """
 
-    eye_score = (
-        20
-        + blink_n * 25
-        + perclos_n * 30
-        + motion_n * 15
-        + pupil_n * 10
+    eye = state.eye_metrics or {}
+    kb  = state.keyboard_load
+
+    # -------------------------
+    # SAFE keyboard transform
+    # -------------------------
+    if kb is None:
+        kb_score = 0.0
+    else:
+        try:
+            kb_score = (float(kb) ** 1.8) * 2.5
+        except:
+            kb_score = 0.0
+
+    # -------------------------
+    # Eye metric extraction
+    # -------------------------
+    blink_rate    = eye.get("blink_rate_per_min", 0.0) or 0.0
+    perclos       = eye.get("perclos", 0.0) or 0.0
+    pupil_delta   = eye.get("pupil_delta", 0.0) or 0.0
+    face_detected = eye.get("face_detected", False)
+
+    # =====================================================
+    # EYE EFFECT (Dominant but stable)
+    # =====================================================
+
+    eye_effect = 0.0
+
+    # --- NONLINEAR blink influence (prevents spikes)
+    blink_diff = max(0.0, blink_rate - 40.0)
+    eye_effect += (blink_diff ** 1.3) * 0.07
+
+    # softened perclos
+    eye_effect += perclos * 32.0
+
+    # softened pupil influence
+    eye_effect += pupil_delta * 18.0
+
+    # =====================================================
+    # KEYBOARD EFFECT (stabilizer)
+    # =====================================================
+
+    keyboard_effect = kb_score * 10.0
+
+    # =====================================================
+    # BASE STRESS
+    # =====================================================
+
+    stress = 50.0 + eye_effect + keyboard_effect
+
+    # If face lost → gentle decay
+    if not face_detected:
+        stress -= 0.4
+
+    # Clamp
+    stress = max(0.0, min(100.0, stress))
+
+    # =====================================================
+    # TEMPORAL SMOOTHING (VERY IMPORTANT)
+    # =====================================================
+
+    alpha = 0.25
+    state.smoothed_stress = (
+        alpha * stress + (1 - alpha) * state.smoothed_stress
     )
 
-    return eye_score
+    return float(state.smoothed_stress)
 
+# ============================================================
+# BROADCAST
+# ============================================================
 
-def compute_stress(state):
-    eye = state["eye_metrics"]
-    kb = state["keyboard_load"]
+async def broadcast(payload):
+    dead = []
 
-    # -------------------------
-    # EYE COMPONENT
-    # -------------------------
-    eye_score = compute_eye_score(eye)
-
-    # -------------------------
-    # KEYBOARD COMPONENT
-    # -------------------------
-    if kb is not None:
+    for ws in clients:
         try:
-            kb = float(kb)
-            kb = _clamp01(kb)
+            await ws.send_json(payload)
+        except:
+            dead.append(ws)
 
-            # nonlinear shaping
-            kb_activation = (kb ** 1.8)
-
-        except Exception:
-            kb_activation = 0.0
-    else:
-        kb_activation = 0.0
-
-    # -------------------------
-    # SMART FUSION
-    # -------------------------
-    # typing when calm ≠ stress
-    if eye_score < 35:
-        kb_gain = 0.25
-    elif eye_score < 50:
-        kb_gain = 0.6
-    else:
-        kb_gain = 1.0
-
-    total = eye_score * (1.0 + kb_gain * kb_activation)
-
-    # smooth scale into 0–100 range
-    stress = _clamp(total, 0, 100)
-
-    return round(stress, 1)
-
+    for ws in dead:
+        clients.discard(ws)
 
 # ============================================================
 # WEBSOCKET
 # ============================================================
 
 @app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
+async def websocket_endpoint(ws: WebSocket):
+    await ws.accept()
+    clients.add(ws)
 
     print("Client connected")
 
     try:
         while True:
-            msg = await websocket.receive_json()
+            raw = await ws.receive_text()
 
-            source = msg.get("type")
+            try:
+                msg = json.loads(raw)
+            except:
+                print("Bad JSON received")
+                continue
 
-            # -------------------------
-            # UPDATE SHARED STATE
-            # -------------------------
-            if source == "eye_metrics":
-                state["eye_metrics"] = msg["data"]
+            msg_type = msg.get("type")
 
-            elif source == "keyboard_load":
-                state["keyboard_load"] = msg["value"]
+            # ======================================
+            # UPDATE STATE
+            # ======================================
 
-            # -------------------------
+            if msg_type == "eye_metrics":
+                # supports both old + new camera_client schemas
+                state.eye_metrics = msg.get("value") or msg.get("data")
+
+            elif msg_type == "keyboard_load":
+                val = msg.get("value")
+                if val is not None:
+                    try:
+                        state.keyboard_load = float(val)
+                    except:
+                        pass
+
+            # ======================================
             # FUSE ONCE
-            # -------------------------
-            stress_score = compute_stress(state)
+            # ======================================
+
+            stress_score = fuse(state)
+
+            payload = {
+                "type": "stress_score",
+                "value": stress_score
+            }
 
             print("\n--- UPDATE ---")
-            print("source:", source)
-            print("eye_metrics:", state["eye_metrics"])
-            print("keyboard_load:", state["keyboard_load"])
-            print("stress_score:", stress_score)
+            print("source:", msg_type)
+            print("eye_metrics:", "OK" if state.eye_metrics else None)
+            print("keyboard_load:", state.keyboard_load)
+            print("stress_score:", round(stress_score, 1))
 
-            await websocket.send_json({
-                "type": "fusion_update",
-                "stress_score": stress_score,
-                "eye_metrics": state["eye_metrics"],
-                "keyboard_load": state["keyboard_load"]
-            })
+            await broadcast(payload)
 
-    except Exception:
+    except WebSocketDisconnect:
         print("Client disconnected cleanly")
-
+        clients.discard(ws)
 
 # ============================================================
-# MAIN
+# RUN SERVER
 # ============================================================
 
 if __name__ == "__main__":
