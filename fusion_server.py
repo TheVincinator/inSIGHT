@@ -3,15 +3,8 @@ import json
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 import uvicorn
 
-# ============================================================
-# GLOBAL APP
-# ============================================================
-
 app = FastAPI()
 
-# ============================================================
-# SHARED STATE
-# ============================================================
 
 class FusionState:
     def __init__(self):
@@ -21,10 +14,6 @@ class FusionState:
 
 state = FusionState()
 clients = set()
-
-# ============================================================
-# SMART HUMAN-CALIBRATED FUSION
-# ============================================================
 
 def fuse(state: FusionState) -> float:
     """
@@ -39,9 +28,6 @@ def fuse(state: FusionState) -> float:
     eye = state.eye_metrics or {}
     kb  = state.keyboard_load
 
-    # -------------------------
-    # SAFE keyboard transform
-    # -------------------------
     if kb is None:
         kb_score = 0.0
     else:
@@ -50,52 +36,24 @@ def fuse(state: FusionState) -> float:
         except:
             kb_score = 0.0
 
-    # -------------------------
-    # Eye metric extraction
-    # -------------------------
     blink_rate    = eye.get("blink_rate_per_min", 0.0) or 0.0
     perclos       = eye.get("perclos", 0.0) or 0.0
     pupil_delta   = eye.get("pupil_delta", 0.0) or 0.0
     face_detected = eye.get("face_detected", False)
 
-    # =====================================================
-    # EYE EFFECT (Dominant but stable)
-    # =====================================================
-
     eye_effect = 0.0
 
-    # --- NONLINEAR blink influence (prevents spikes)
     blink_diff = max(0.0, blink_rate - 40.0)
     eye_effect += (blink_diff ** 1.3) * 0.07
-
-    # softened perclos
     eye_effect += perclos * 32.0
-
-    # softened pupil influence
     eye_effect += pupil_delta * 18.0
-
-    # =====================================================
-    # KEYBOARD EFFECT (stabilizer)
-    # =====================================================
-
     keyboard_effect = kb_score * 10.0
-
-    # =====================================================
-    # BASE STRESS
-    # =====================================================
-
     stress = 50.0 + eye_effect + keyboard_effect
 
-    # If face lost → gentle decay
     if not face_detected:
         stress -= 0.4
 
-    # Clamp
     stress = max(0.0, min(100.0, stress))
-
-    # =====================================================
-    # TEMPORAL SMOOTHING (VERY IMPORTANT)
-    # =====================================================
 
     alpha = 0.25
     state.smoothed_stress = (
@@ -103,10 +61,6 @@ def fuse(state: FusionState) -> float:
     )
 
     return float(state.smoothed_stress)
-
-# ============================================================
-# BROADCAST
-# ============================================================
 
 async def broadcast(payload):
     dead = []
@@ -119,10 +73,6 @@ async def broadcast(payload):
 
     for ws in dead:
         clients.discard(ws)
-
-# ============================================================
-# WEBSOCKET
-# ============================================================
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
@@ -143,12 +93,7 @@ async def websocket_endpoint(ws: WebSocket):
 
             msg_type = msg.get("type")
 
-            # ======================================
-            # UPDATE STATE
-            # ======================================
-
             if msg_type == "eye_metrics":
-                # supports both old + new camera_client schemas
                 state.eye_metrics = msg.get("value") or msg.get("data")
 
             elif msg_type == "keyboard_load":
@@ -158,10 +103,6 @@ async def websocket_endpoint(ws: WebSocket):
                         state.keyboard_load = float(val)
                     except:
                         pass
-
-            # ======================================
-            # FUSE ONCE
-            # ======================================
 
             stress_score = fuse(state)
 
@@ -181,10 +122,6 @@ async def websocket_endpoint(ws: WebSocket):
     except WebSocketDisconnect:
         print("Client disconnected cleanly")
         clients.discard(ws)
-
-# ============================================================
-# RUN SERVER
-# ============================================================
 
 if __name__ == "__main__":
     uvicorn.run("fusion_server:app", host="0.0.0.0", port=8000, reload=True)

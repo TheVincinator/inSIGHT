@@ -14,11 +14,6 @@ Run:
 Quit: press 'q' in the OpenCV window or terminate the program in terminal using Ctrl-C
 """
 
-# ================================================================
-# camera_client.py  (FULL VERSION — WITH SERVO FACE TRACKING +
-#                     FREEZE LAST EYE METRICS WHEN FACE LOST)
-# ================================================================
-
 import asyncio
 import json
 import time
@@ -34,9 +29,6 @@ import requests
 
 stress_score = 0.0
 
-# ------------------------------------------------
-# Tunables
-# ------------------------------------------------
 WS_URL = "ws://127.0.0.1:8000/ws"
 SEND_HZ = 1.0
 WINDOW_SEC = 15.0
@@ -57,9 +49,6 @@ EAR_FALLBACK_THRESH = 0.21
 PUPIL_OPEN_MARGIN = 0.02
 PUPIL_MEDIAN_N = 5
 
-# =========================================================
-# SERVO SETTINGS
-# =========================================================
 ESP32_SERVO_URL = "http://10.48.126.77/servo"
 
 DEAD_ZONE = 0.08
@@ -80,14 +69,8 @@ def send_servo_command(speed):
     except:
         pass
 
-# =========================================================
-# Freeze last valid eye metrics (NEW)
-# =========================================================
 last_valid_eye_metrics = None
 
-# ------------------------------------------------
-# Landmarks
-# ------------------------------------------------
 L_EYE = {"p1":33,"p4":133,"p2":160,"p6":144,"p3":158,"p5":153}
 R_EYE = {"p1":362,"p4":263,"p2":387,"p6":373,"p3":385,"p5":380}
 
@@ -95,9 +78,6 @@ NOSE_TIP_IDX = 1
 LEFT_EYE_OUTER = 33
 RIGHT_EYE_OUTER = 362
 
-# ------------------------------------------------
-# Helpers
-# ------------------------------------------------
 def _pt(landmarks, idx, w, h):
     lm = landmarks[idx]
     return np.array([lm.x*w, lm.y*h], dtype=np.float32)
@@ -115,9 +95,6 @@ def ear_from_eye(landmarks, eye_idx_map, w, h):
     hdist=np.linalg.norm(p1-p4)+1e-6
     return float((v1+v2)/(2.0*hdist))
 
-# ------------------------------------------------
-# Window Stats
-# ------------------------------------------------
 @dataclass
 class WindowStats:
     samples:Deque[Tuple[float,bool,int,float]]
@@ -143,9 +120,6 @@ class WindowStats:
         m=np.array([s[3] for s in self.samples],dtype=np.float32)
         return float(np.var(m))
 
-# ------------------------------------------------
-# Receive loop
-# ------------------------------------------------
 async def receive_loop(ws):
     global stress_score
     while True:
@@ -157,9 +131,6 @@ async def receive_loop(ws):
         except:
             break
 
-# ================================================================
-# CAMERA LOOP
-# ================================================================
 async def camera_loop():
     global servo_filtered,last_servo_send,last_valid_eye_metrics
 
@@ -234,9 +205,6 @@ async def camera_loop():
 
                 nose_xy=_pt(lms,NOSE_TIP_IDX,w,h)
 
-                # ============================
-                # SERVO FACE CENTERING
-                # ============================
                 frame_center_x=w/2
                 face_error=(nose_xy[0]-frame_center_x)/frame_center_x
 
@@ -282,9 +250,6 @@ async def camera_loop():
             perclos=win.perclos()
             head_var=win.head_motion_var()
 
-            # =====================================================
-            # FREEZE LAST VALID EYE METRICS (NEW)
-            # =====================================================
             current_eye_metrics={
                 "blink_rate_per_min":blink_rate,
                 "perclos":perclos,
@@ -300,8 +265,6 @@ async def camera_loop():
                 last_valid_eye_metrics=current_eye_metrics
 
             send_metrics=last_valid_eye_metrics if last_valid_eye_metrics else current_eye_metrics
-
-            # =====================================================
 
             cv2.putText(frame,"STRESS",(20,35),
                         cv2.FONT_HERSHEY_DUPLEX,0.5,(200,200,200),1)
@@ -326,6 +289,5 @@ async def camera_loop():
     cap.release()
     cv2.destroyAllWindows()
 
-# ================================================================
 if __name__=="__main__":
     asyncio.run(camera_loop())

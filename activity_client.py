@@ -5,9 +5,6 @@ from pynput import keyboard, mouse
 from collections import deque
 import os
 
-# =========================
-# GLOBAL STATE
-# =========================
 keyboard_events = []
 mouse_events    = []
 scroll_events   = []
@@ -41,9 +38,6 @@ FEATURE_COLS = [
     "scroll_reversal_rate", "idle_ratio",
 ]
 
-# =========================
-# KEYBOARD LISTENER
-# =========================
 def on_key_press(key):
     t = time.time()
     with _lock:
@@ -76,9 +70,6 @@ def on_key_release(key):
                     ev["hold_duration"] = hold
                     break
 
-# =========================
-# MOUSE LISTENER
-# =========================
 def on_move(x, y):
     global _last_mouse_pos, _last_mouse_time, _pre_click_dwell
     t = time.time()
@@ -127,9 +118,6 @@ def on_scroll(_x, _y, dx, dy):
             "dy": dy,
         })
 
-# =========================
-# FEATURE EXTRACTION
-# =========================
 def extract_features(kb_snapshot, ms_snapshot, sc_snapshot, prev_last_key_time=None):
     if len(kb_snapshot) < 2:
         return None
@@ -203,9 +191,6 @@ def extract_features(kb_snapshot, ms_snapshot, sc_snapshot, prev_last_key_time=N
         idle_ratio,
     ]).reshape(1, -1)
 
-# =========================
-# LOAD EVALUATION
-# =========================
 def evaluate_load(features):
     f = features[0]
     typing_speed = f[1]
@@ -220,9 +205,6 @@ def evaluate_load(features):
 
     return max(0.0, min(1.0, score))
 
-# =========================
-# SNAPSHOT
-# =========================
 def _take_snapshot():
     global _prev_window_last_key_time
 
@@ -243,9 +225,6 @@ def _take_snapshot():
 
     return kb_window, ms_window, sc_window, prev_last
 
-# =========================
-# BACKGROUND SCORE THREAD
-# =========================
 def _score_updater_loop():
     global _latest_keyboard_score, _smoothed_score, _score_thread_running
 
@@ -270,15 +249,9 @@ def _score_updater_loop():
 
         _latest_keyboard_score = _smoothed_score
 
-# =========================
-# PUBLIC API
-# =========================
 def get_keyboard_load_score():
     return _latest_keyboard_score
 
-# =========================
-# START / STOP
-# =========================
 _keyboard_listener = None
 _mouse_listener    = None
 
@@ -328,9 +301,6 @@ def stop_monitoring():
 
     print("[activity_client] monitoring stopped")
 
-# =========================
-# ENTRY POINT (UI MODE)
-# =========================
 if __name__ == "__main__":
     start_monitoring()
     try:
