@@ -1,142 +1,229 @@
 import asyncio
 import json
+import time
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 import uvicorn
 
 app = FastAPI()
 
+
 class FusionState:
     def __init__(self):
-        self.eye_metrics = None
-        self.keyboard_load = None
-        self.smoothed_stress = 50.0  # persistent smoothing
+        self.eye_metrics     = None
+        self.keyboard_load   = None
+        self.smoothed_stress = 50.0  # persistent smoothed output
+        self.face_absent_since: float | None = None  # timestamp when face was last lost
 
-state = FusionState()
-clients = set()
+
+state       = FusionState()
+subscribers = set()   # display/consumer clients on /ws/subscribe
+
 
 def stress_label(score: float) -> str:
-    """
-    Convert numeric stress score into human-readable state.
-    Tuned to your current scoring scale.
-    """
-    if score < 40:
+    if score < 45:
         return "calm"
     elif score < 70:
         return "normal"
     else:
         return "stressed"
 
+
 def fuse(state: FusionState) -> float:
     """
-    Human-calibrated stress fusion.
+    Fuse eye and keyboard signals into a single stress score on [0, 100].
 
-    Eye metrics ≈ dominant signal (~70%)
-    Keyboard ≈ stabilizer (~30%)
-
-    Designed to feel natural rather than linear.
+    Returns the raw (unsmoothed) instantaneous stress estimate.
+    Smoothing is applied by the caller so that fuse() remains a pure function
+    with no hidden state mutation.
     """
-
     eye = state.eye_metrics or {}
     kb  = state.keyboard_load
 
+    # ---- Keyboard contribution: bidirectional, centred on 0 ----
     if kb is None:
-        kb_score = 0.0
+        kb_effect = 0.0
     else:
-        try:
-            kb_score = (float(kb) ** 1.8) * 2.5
-        except:
-            kb_score = 0.0
+        kb_norm   = float(kb) * 2.0 - 1.0
+        kb_effect = kb_norm * 15.0
 
-    blink_rate    = eye.get("blink_rate_per_min", 0.0) or 0.0
-    perclos       = eye.get("perclos", 0.0) or 0.0
-    pupil_delta   = eye.get("pupil_delta", 0.0) or 0.0
-    face_detected = eye.get("face_detected", False)
+    # ---- Eye metric contributions ----
+    blink_rate     = eye.get("blink_rate_per_min", 0.0) or 0.0
+    low_blink_rate = eye.get("low_blink_rate",     0.0) or 0.0
+    perclos        = eye.get("perclos",            0.0) or 0.0
+    pupil_delta    = eye.get("pupil_delta",        0.0) or 0.0
+    face_detected  = eye.get("face_detected",      False)
 
     eye_effect = 0.0
-
-    blink_diff = max(0.0, blink_rate - 40.0)
-    eye_effect += (blink_diff ** 1.3) * 0.07
+    blink_high_diff = max(0.0, blink_rate - 40.0)
+    eye_effect += (blink_high_diff ** 1.3) * 0.07
+    eye_effect += low_blink_rate * 12.0
     eye_effect += perclos * 32.0
-    eye_effect += pupil_delta * 18.0
+    eye_effect += max(0.0, pupil_delta) * 18.0
 
-    keyboard_effect = kb_score * 10.0
+    stress = 50.0 + eye_effect + kb_effect
+    return float(max(0.0, min(100.0, stress)))
 
-    stress = 50.0 + eye_effect + keyboard_effect
 
-    if not face_detected:
-        stress -= 0.4
-
-    stress = max(0.0, min(100.0, stress))
-
-    alpha = 0.25
-    state.smoothed_stress = (
-        alpha * stress + (1 - alpha) * state.smoothed_stress
-    )
-
-    return float(state.smoothed_stress)
-
-async def broadcast(payload):
+async def broadcast(payload: dict):
+    """Push a stress update to all subscribed display/consumer clients."""
     dead = []
-
-    for ws in clients:
+    for ws in subscribers:
         try:
             await ws.send_json(payload)
-        except:
+        except Exception as e:
+            print(f"[fusion_server] broadcast: dropping subscriber after error: {e}")
             dead.append(ws)
-
     for ws in dead:
-        clients.discard(ws)
+        subscribers.discard(ws)
 
-@app.websocket("/ws")
-async def websocket_endpoint(ws: WebSocket):
+
+# How long the face must be absent before the score starts decaying toward neutral.
+FACE_ABSENT_FREEZE_SEC = 10.0
+# Decay rate: points per second the score moves toward 50 after the freeze window.
+FACE_ABSENT_DECAY_RATE = 1.0
+
+
+def _process_message(msg: dict):
+    """
+    Update fusion state from an inbound sensor message.
+    Returns a broadcast payload dict if state was updated, else None.
+
+    Face-absent policy
+    ------------------
+    When the face is not detected:
+      - For the first FACE_ABSENT_FREEZE_SEC seconds: freeze the score.
+        The last measured value is the best estimate — don't inject noise.
+      - After that: decay slowly toward neutral (50) at FACE_ABSENT_DECAY_RATE
+        points/second. A long absence likely means the session has been
+        interrupted, so neutral is a more honest default than holding a stale peak.
+    When the face returns: resume normal fusion immediately.
+    """
+    msg_type = msg.get("type")
+
+    if msg_type == "eye_metrics":
+        state.eye_metrics = msg.get("value") or msg.get("data")
+
+    elif msg_type == "keyboard_load":
+        val = msg.get("value")
+        if val is not None:
+            try:
+                state.keyboard_load = float(val)
+            except (TypeError, ValueError):
+                return None
+    else:
+        return None  # unknown message type — ignore without crashing
+
+    now          = time.monotonic()
+    eye          = state.eye_metrics or {}
+    face_detected = eye.get("face_detected", False)
+
+    if face_detected:
+        # Face is present — clear the absent timer and run normal fusion.
+        state.face_absent_since = None
+
+        raw_stress            = fuse(state)
+        alpha                 = 0.25
+        state.smoothed_stress = alpha * raw_stress + (1 - alpha) * state.smoothed_stress
+
+    else:
+        # Face is absent — start or continue the absence timer.
+        if state.face_absent_since is None:
+            state.face_absent_since = now
+
+        absent_for = now - state.face_absent_since
+
+        if absent_for < FACE_ABSENT_FREEZE_SEC:
+            # Within freeze window: hold the score exactly where it is.
+            pass
+        else:
+            # Beyond freeze window: decay toward neutral at a fixed rate.
+            # We apply the decay in proportion to one update cycle (~1s at SEND_HZ=1).
+            # Using a fixed step rather than alpha-smooth so the rate is predictable.
+            decay_step = FACE_ABSENT_DECAY_RATE  # points per update cycle
+            current    = state.smoothed_stress
+            if current > 50.0:
+                state.smoothed_stress = max(50.0, current - decay_step)
+            elif current < 50.0:
+                state.smoothed_stress = min(50.0, current + decay_step)
+            # If exactly 50, nothing to do.
+
+    stress_score = state.smoothed_stress
+    label        = stress_label(stress_score)
+
+    eye                = state.eye_metrics or {}
+    absent_for_display = (now - state.face_absent_since) if state.face_absent_since else 0.0
+
+    print("\n--- UPDATE ---")
+    print("source        :", msg_type)
+    print("face_detected :", face_detected,
+          f"| absent for {absent_for_display:.1f}s" if not face_detected else "")
+    print("keyboard_load :", round(state.keyboard_load, 3) if state.keyboard_load is not None else None)
+    print("eye ► blink   :", round(eye.get("blink_rate_per_min", 0.0), 1), "blinks/min",
+          "| low_blink:", round(eye.get("low_blink_rate", 0.0), 2))
+    print("eye ► perclos :", round(eye.get("perclos", 0.0), 3))
+    print("eye ► pupil Δ :", round(eye.get("pupil_delta", 0.0), 3))
+    print("eye ► EAR     :", round(eye.get("ear", 0.0) or 0.0, 3),
+          "| thresh:", round(eye.get("ear_thresh", 0.0) or 0.0, 3))
+    print("stress_score  :", round(stress_score, 1), "| state:", label)
+
+    return {"type": "stress_score", "value": stress_score, "state": label}
+
+
+@app.websocket("/ws/ingest")
+async def ingest_endpoint(ws: WebSocket):
+    """
+    Send-only endpoint for sensor clients (camera_client, run.py).
+
+    The server never pushes stress scores back down this connection, so there
+    is no receive-buffer back-pressure and no cross-client interference.
+
+    Previously all clients shared /ws and the server broadcast stress scores
+    back to run.py, which had no receive loop to drain them. This caused
+    buffer build-up and triggered 'no close frame' disconnects whenever the
+    camera hiccupped and sent a burst of rapid messages.
+    """
     await ws.accept()
-    clients.add(ws)
-
-    print("Client connected")
+    print("[fusion_server] ingest client connected")
 
     try:
         while True:
             raw = await ws.receive_text()
-
             try:
                 msg = json.loads(raw)
-            except:
-                print("Bad JSON received")
+            except json.JSONDecodeError:
+                print("[fusion_server] bad JSON on ingest, skipping")
                 continue
 
-            msg_type = msg.get("type")
-
-            if msg_type == "eye_metrics":
-                state.eye_metrics = msg.get("value") or msg.get("data")
-
-            elif msg_type == "keyboard_load":
-                val = msg.get("value")
-                if val is not None:
-                    try:
-                        state.keyboard_load = float(val)
-                    except:
-                        pass
-
-            stress_score = fuse(state)
-            label = stress_label(stress_score)
-
-            payload = {
-                "type": "stress_score",
-                "value": stress_score,
-                "state": label,  
-            }
-
-            print("\n--- UPDATE ---")
-            print("source:", msg_type)
-            print("eye_metrics:", "OK" if state.eye_metrics else None)
-            print("keyboard_load:", state.keyboard_load)
-            print("stress_score:", round(stress_score, 1), "| state:", label)
-
-            await broadcast(payload)
+            payload = _process_message(msg)
+            if payload:
+                await broadcast(payload)
 
     except WebSocketDisconnect:
-        print("Client disconnected cleanly")
-        clients.discard(ws)
+        print("[fusion_server] ingest client disconnected cleanly")
+    except Exception as e:
+        print(f"[fusion_server] ingest client error: {e}")
+
+
+@app.websocket("/ws/subscribe")
+async def subscribe_endpoint(ws: WebSocket):
+    """
+    Receive-only endpoint for display/consumer clients that want stress score
+    updates but never send sensor data (e.g. a dashboard UI).
+    """
+    await ws.accept()
+    subscribers.add(ws)
+    print(f"[fusion_server] subscriber connected ({len(subscribers)} total)")
+
+    try:
+        while True:
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        print("[fusion_server] subscriber disconnected cleanly")
+    except Exception as e:
+        print(f"[fusion_server] subscriber error: {e}")
+    finally:
+        subscribers.discard(ws)
+
 
 if __name__ == "__main__":
     uvicorn.run("fusion_server:app", host="0.0.0.0", port=8000, reload=True)
