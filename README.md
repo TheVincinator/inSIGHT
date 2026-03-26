@@ -1,6 +1,12 @@
 # Real-Time Cognitive Load Monitor
 
-Estimates cognitive load in real time by fusing signals from a webcam (eye tracking) and the keyboard/mouse. A central server combines the signals and broadcasts a live stress score to all connected clients.
+Estimates cognitive load in real time by fusing three signal sources:
+
+- **Eye tracking** — blink rate, PERCLOS, pupil dilation via webcam
+- **rPPG heart rate** — camera-based heart rate using the POS algorithm (no wearable required)
+- **Keyboard / mouse behaviour** — typing patterns, error rate, mouse velocity
+
+A central server fuses the signals and broadcasts a live stress score to all connected clients.
 
 ---
 
@@ -14,9 +20,10 @@ run.py            ──┘
 
 | Component | Role |
 |---|---|
-| `fusion_server.py` | FastAPI WebSocket server — fuses eye and keyboard signals, broadcasts a stress score on `[0, 100]` |
-| `camera_client.py` | Reads the webcam, extracts eye metrics (blink rate, PERCLOS, pupil dilation), renders a live HUD overlay |
+| `fusion_server.py` | FastAPI WebSocket server — fuses all signals, broadcasts a stress score on `[0, 100]` |
+| `camera_client.py` | Reads the webcam, extracts eye metrics and rPPG heart rate, renders a live HUD overlay |
 | `run.py` | Monitors keyboard and mouse activity, computes a cognitive load score, and forwards it to the server |
+| `rppg.py` | POS rPPG algorithm — estimates heart rate from subtle skin colour changes in the face |
 
 All tunable parameters (thresholds, camera index, server address, ESP32 IP) live in **`config.py`**.
 
@@ -63,7 +70,10 @@ Edit `config.py` to change:
 - `SERVER_HOST` / `SERVER_PORT` — where the fusion server listens
 - `CAMERA_INDEX` — which webcam to use (`0` = default)
 - `ESP32_SERVO_URL` — URL of the pan-tilt servo endpoint; set to `None` to disable servo tracking
-- Eye-tracking thresholds, window sizes, and fusion parameters
+- Eye-tracking thresholds, window sizes, and fusion weights
+- `RPPG_ENABLED` — set to `False` to disable heart rate estimation without touching other code
+- `RPPG_WINDOW_SEC` / `RPPG_MIN_WINDOW_SEC` — how much signal history rPPG uses before emitting an estimate
+- `RPPG_HR_BASELINE` / `RPPG_HR_WEIGHT` — tune how much heart rate influences the stress score
 
 ---
 
@@ -87,7 +97,8 @@ When stress transitions into the *stressed* state, an audio alert plays from the
 .
 ├── config.py            — all tunable parameters
 ├── fusion_server.py     — WebSocket fusion server
-├── camera_client.py     — eye-tracking client + HUD
+├── camera_client.py     — eye-tracking + rPPG client + HUD
+├── rppg.py              — POS rPPG heart rate estimator
 ├── run.py               — keyboard/mouse activity client
 ├── activity_client.py   — keyboard/mouse feature extraction library
 ├── requirements.txt
