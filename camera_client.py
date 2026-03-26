@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import random
+import signal
 import threading
 import time
 from collections import deque
@@ -12,8 +13,17 @@ import cv2
 import mediapipe as mp
 import numpy as np
 import pygame
-import websockets
 import requests
+import websockets
+
+from config import (
+    CAM_HEIGHT, CAM_WIDTH, CAMERA_INDEX,
+    EAR_BASELINE_SEC, EAR_FALLBACK_THRESH, EAR_THRESH_FRAC,
+    ESP32_SERVO_URL, EYE_EYE_SEND_HZ, EYE_EYE_WINDOW_SEC,
+    LOW_BLINK_THRESH, RETRY_DELAY,
+    SERVO_ALPHA, SERVO_SERVO_DEAD_ZONE, SERVO_GAIN, SERVO_EYE_SEND_HZ,
+    WS_INGEST_URL, WS_SUBSCRIBE_URL,
+)
 
 # ---- Audio alert setup ----
 # On each stress trigger: plays stress_alert.wav first, waits for it to finish,
@@ -71,42 +81,22 @@ stress_score       = 0.0
 stress_state       = "normal"
 _prev_stress_state = "normal"  # tracks last state to detect transitions into "stressed"
 
-WS_URL           = "ws://127.0.0.1:8000/ws/ingest"    # camera sends eye metrics here
-WS_SUBSCRIBE_URL = "ws://127.0.0.1:8000/ws/subscribe"  # camera receives stress scores here
-SEND_HZ  = 1.0
-WINDOW_SEC = 15.0
-
-CAM_WIDTH    = 640
-CAM_HEIGHT   = 480
-CAMERA_INDEX = 0
-CAP_BACKEND  = cv2.CAP_AVFOUNDATION
+# macOS capture backend; use cv2.CAP_ANY on Linux/Windows
+CAP_BACKEND = cv2.CAP_AVFOUNDATION
 
 MIN_FACE_CONF  = 0.5
 MIN_TRACK_CONF = 0.5
-
-EAR_BASELINE_SEC  = 2.0
-EAR_THRESH_FRAC   = 0.75
-EAR_FALLBACK_THRESH = 0.21
-
-# Low blink rate threshold: below this (blinks/min) sustained fixation is flagged.
-# Normal resting blink rate is ~15-20/min; stress/focus suppresses it.
-LOW_BLINK_THRESH = 10.0
-
-ESP32_SERVO_URL = "http://10.48.126.77/servo"
-
-DEAD_ZONE   = 0.08
-SERVO_GAIN  = 0.6
-SERVO_ALPHA = 0.25
-SERVO_SEND_HZ = 10
 
 servo_filtered  = 0.0
 last_servo_send = 0.0
 
 
 def send_servo_command(speed):
+    if not ESP32_SERVO_URL:
+        return
     try:
         requests.get(ESP32_SERVO_URL, params={"pan": float(speed)}, timeout=0.02)
-    except:
+    except Exception:
         pass
 
 
@@ -125,6 +115,8 @@ R_EYE = {"p1": 362, "p4": 263, "p2": 387, "p6": 373, "p3": 385, "p5": 380}
 NOSE_TIP_IDX    = 1
 LEFT_EYE_OUTER  = 33
 RIGHT_EYE_OUTER = 362
+LEFT_EYE_INNER  = 133   # medial canthus, inner corner of left eye
+RIGHT_EYE_INNER = 263   # medial canthus, inner corner of right eye
 
 # Iris landmark indices (available with refine_landmarks=True)
 # Left iris centre = 468, right iris centre = 473
@@ -256,12 +248,14 @@ async def camera_loop():
     cap = cv2.VideoCapture(CAMERA_INDEX, CAP_BACKEND)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CAM_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
+    print(f"[camera_client] opened camera {CAMERA_INDEX} ({CAM_WIDTH}x{CAM_HEIGHT})")
 
     try:
         await _camera_loop_inner(cap)
     finally:
         cap.release()
         cv2.destroyAllWindows()
+        print("[camera_client] shut down cleanly")
 
 
 async def _camera_loop_inner(cap):
@@ -295,173 +289,187 @@ async def _camera_loop_inner(cap):
 
     prev_nose_xy = None
 
-    async with websockets.connect(WS_URL) as ws, \
-               websockets.connect(WS_SUBSCRIBE_URL) as ws_sub:
-        asyncio.create_task(receive_loop(ws_sub))
+    while True:  # reconnect loop
+        try:
+            async with websockets.connect(WS_INGEST_URL) as ws, \
+                       websockets.connect(WS_SUBSCRIBE_URL) as ws_sub:
+                asyncio.create_task(receive_loop(ws_sub))
 
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                await asyncio.sleep(0.01)
-                continue
+                while True:
+                    ok, frame = cap.read()
+                    if not ok:
+                        await asyncio.sleep(0.01)
+                        continue
 
-            frame = cv2.flip(frame, 1)
-            h, w  = frame.shape[:2]
-            rgb   = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    frame = cv2.flip(frame, 1)
+                    h, w  = frame.shape[:2]
+                    rgb   = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-            res = mesh.process(rgb)
-            now = time.time()
+                    res = mesh.process(rgb)
+                    now = time.time()
 
-            blink_event  = 0
-            ear          = None
-            is_closed    = False
-            motion_norm  = 0.0
-            face_detected = False
-            pupil_delta  = 0.0   # normalised deviation from personal iris baseline
+                    blink_event   = 0
+                    ear           = None
+                    is_closed     = False
+                    motion_norm   = 0.0
+                    face_detected = False
+                    pupil_delta   = 0.0   # normalised deviation from personal iris baseline
 
-            if res.multi_face_landmarks:
-                face_detected = True
-                face = res.multi_face_landmarks[0]
-                lms  = face.landmark
+                    if res.multi_face_landmarks:
+                        face_detected = True
+                        face = res.multi_face_landmarks[0]
+                        lms  = face.landmark
 
-                ear_l = ear_from_eye(lms, L_EYE, w, h)
-                ear_r = ear_from_eye(lms, R_EYE, w, h)
-                ear   = (ear_l + ear_r) / 2.0
+                        ear_l = ear_from_eye(lms, L_EYE, w, h)
+                        ear_r = ear_from_eye(lms, R_EYE, w, h)
+                        ear   = (ear_l + ear_r) / 2.0
 
-                if ear_baseline_start is None:
-                    ear_baseline_start = now
-                if (now - ear_baseline_start) <= EAR_BASELINE_SEC:
-                    ear_baseline_samples.append(ear)
-                if (now - ear_baseline_start) > EAR_BASELINE_SEC and len(ear_baseline_samples) >= 10:
-                    open_med   = float(np.median(ear_baseline_samples))
-                    ear_thresh = max(0.10, EAR_THRESH_FRAC * open_med)
+                        if ear_baseline_start is None:
+                            ear_baseline_start = now
+                        if (now - ear_baseline_start) <= EAR_BASELINE_SEC:
+                            ear_baseline_samples.append(ear)
+                        if (now - ear_baseline_start) > EAR_BASELINE_SEC and len(ear_baseline_samples) >= 10:
+                            open_med   = float(np.median(ear_baseline_samples))
+                            ear_thresh = max(0.10, EAR_THRESH_FRAC * open_med)
 
-                is_closed = ear < ear_thresh
+                        is_closed = ear < ear_thresh
 
-                # --- Iris / pupil delta ---
-                # Compute a scale-invariant iris size ratio for each eye, average them,
-                # then compare against a slow-updating personal baseline to get a delta.
-                # Positive delta = dilation (associated with stress/arousal).
-                try:
-                    iris_l = iris_diameter_px(lms, LEFT_IRIS_IDX,  LEFT_EYE_OUTER,  33,  w, h)
-                    iris_r = iris_diameter_px(lms, RIGHT_IRIS_IDX, RIGHT_EYE_OUTER, 362, w, h)
-                    iris_now = (iris_l + iris_r) / 2.0
+                        # --- Iris / pupil delta ---
+                        # Compute a scale-invariant iris size ratio for each eye, average them,
+                        # then compare against a slow-updating personal baseline to get a delta.
+                        # Positive delta = dilation (associated with stress/arousal).
+                        try:
+                            iris_l = iris_diameter_px(lms, LEFT_IRIS_IDX,  LEFT_EYE_OUTER,  LEFT_EYE_INNER,  w, h)
+                            iris_r = iris_diameter_px(lms, RIGHT_IRIS_IDX, RIGHT_EYE_OUTER, RIGHT_EYE_INNER, w, h)
+                            iris_now = (iris_l + iris_r) / 2.0
 
-                    iris_baseline_buf.append(iris_now)
-                    baseline = float(np.median(iris_baseline_buf))
+                            iris_baseline_buf.append(iris_now)
+                            baseline = float(np.median(iris_baseline_buf))
 
-                    if iris_ratio_smooth is None:
-                        iris_ratio_smooth = iris_now
+                            if iris_ratio_smooth is None:
+                                iris_ratio_smooth = iris_now
+                            else:
+                                iris_ratio_smooth = IRIS_ALPHA * iris_now + (1 - IRIS_ALPHA) * iris_ratio_smooth
+
+                            # Delta: how much larger/smaller the iris is vs personal baseline.
+                            # Clamp to [-1, 1] for stable downstream use.
+                            pupil_delta = float(np.clip((iris_ratio_smooth - baseline) / (baseline + 1e-6), -1.0, 1.0))
+                        except Exception:
+                            pupil_delta = 0.0
+
+                        # --- Nose / head tracking ---
+                        nose_xy = _pt(lms, NOSE_TIP_IDX, w, h)
+                        cv2.circle(frame, (int(nose_xy[0]), int(nose_xy[1])), 4, (0, 255, 0), -1)
+
+                        frame_center_x = w / 2
+                        face_error = (nose_xy[0] - frame_center_x) / frame_center_x
+
+                        if abs(face_error) < SERVO_DEAD_ZONE:
+                            face_error = 0.0
+
+                        target_speed   = SERVO_GAIN * face_error
+                        servo_filtered = SERVO_ALPHA * target_speed + (1 - SERVO_ALPHA) * servo_filtered
+
+                        if face_error != 0.0 and (now - last_servo_send) > (1.0 / SERVO_EYE_SEND_HZ):
+                            send_servo_command(servo_filtered)
+                            last_servo_send = now
+
+                        l_outer    = _pt(lms, LEFT_EYE_OUTER, w, h)
+                        r_outer    = _pt(lms, RIGHT_EYE_OUTER, w, h)
+                        face_scale = float(np.linalg.norm(l_outer - r_outer) + 1e-6)
+
+                        if prev_nose_xy is not None:
+                            motion_norm = float(np.linalg.norm(nose_xy - prev_nose_xy) / face_scale)
+                        prev_nose_xy = nose_xy
+
+                        # --- Blink detection ---
+                        if not was_closed and is_closed:
+                            blink_armed = True
+                        elif was_closed and not is_closed and blink_armed:
+                            blink_event = 1
+                            blink_armed = False
+                        was_closed = is_closed
+
+                        win.add(now, is_closed, blink_event, motion_norm)
+
                     else:
-                        iris_ratio_smooth = IRIS_ALPHA * iris_now + (1 - IRIS_ALPHA) * iris_ratio_smooth
+                        blink_armed  = False
+                        was_closed   = False
+                        prev_nose_xy = None
+                        cv2.putText(frame, "Face not detected", (10, 145),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-                    # Delta: how much larger/smaller the iris is vs personal baseline.
-                    # Clamp to [-1, 1] for stable downstream use.
-                    pupil_delta = float(np.clip((iris_ratio_smooth - baseline) / (baseline + 1e-6), -1.0, 1.0))
-                except Exception:
-                    pupil_delta = 0.0
+                    win.prune(now, EYE_WINDOW_SEC)
 
-                # --- Nose / head tracking ---
-                nose_xy = _pt(lms, NOSE_TIP_IDX, w, h)
-                cv2.circle(frame, (int(nose_xy[0]), int(nose_xy[1])), 4, (0, 255, 0), -1)
+                    blink_rate = win.blink_rate_per_min()
+                    perclos    = win.perclos()
+                    head_var   = win.head_motion_var()
 
-                frame_center_x = w / 2
-                face_error = (nose_xy[0] - frame_center_x) / frame_center_x
+                    # low_blink_rate: 1.0 when blink_rate == 0, falls linearly to 0.0 at
+                    # LOW_BLINK_THRESH. The outer condition already guarantees the value
+                    # is in [0, 1), so np.clip is not needed but kept for safety.
+                    low_blink_rate = 1.0 - (blink_rate / LOW_BLINK_THRESH) if blink_rate < LOW_BLINK_THRESH else 0.0
 
-                if abs(face_error) < DEAD_ZONE:
-                    face_error = 0.0
+                    current_eye_metrics = {
+                        "blink_rate_per_min": blink_rate,
+                        "low_blink_rate":     low_blink_rate,
+                        "perclos":            perclos,
+                        "head_motion_var":    head_var,
+                        "pupil_delta":        pupil_delta,
+                        "ear":                ear,
+                        "ear_thresh":         ear_thresh,
+                        "face_detected":      face_detected,
+                        "window_sec":         EYE_WINDOW_SEC,
+                        "camera_index":       CAMERA_INDEX,
+                    }
 
-                target_speed   = SERVO_GAIN * face_error
-                servo_filtered = SERVO_ALPHA * target_speed + (1 - SERVO_ALPHA) * servo_filtered
+                    if face_detected:
+                        last_valid_eye_metrics = current_eye_metrics
 
-                if face_error != 0.0 and (now - last_servo_send) > (1.0 / SERVO_SEND_HZ):
-                    send_servo_command(servo_filtered)
-                    last_servo_send = now
+                    send_metrics = last_valid_eye_metrics if last_valid_eye_metrics else current_eye_metrics
 
-                l_outer    = _pt(lms, LEFT_EYE_OUTER, w, h)
-                r_outer    = _pt(lms, RIGHT_EYE_OUTER, w, h)
-                face_scale = float(np.linalg.norm(l_outer - r_outer) + 1e-6)
+                    color = stress_color(stress_state)
 
-                if prev_nose_xy is not None:
-                    motion_norm = float(np.linalg.norm(nose_xy - prev_nose_xy) / face_scale)
-                prev_nose_xy = nose_xy
+                    # Draw a semi-transparent dark background panel behind the HUD text
+                    # so it's readable against any background colour.
+                    overlay = frame.copy()
+                    cv2.rectangle(overlay, (10, 10), (130, 125), (0, 0, 0), -1)
+                    cv2.addWeighted(overlay, 0.45, frame, 0.55, 0, frame)
 
-                # --- Blink detection ---
-                if not was_closed and is_closed:
-                    blink_armed = True
-                elif was_closed and not is_closed and blink_armed:
-                    blink_event = 1
-                    blink_armed = False
-                was_closed = is_closed
+                    cv2.putText(frame, "STRESS",             (20, 35),  cv2.FONT_HERSHEY_DUPLEX, 0.5, (220, 220, 220), 1)
+                    cv2.putText(frame, f"{stress_score:.0f}", (20, 78),  cv2.FONT_HERSHEY_DUPLEX, 1.5, color, 3)
+                    cv2.putText(frame, stress_state.upper(),  (20, 112), cv2.FONT_HERSHEY_DUPLEX, 0.7, color, 2)
+                    cv2.imshow("camera_client", frame)
 
-                win.add(now, is_closed, blink_event, motion_norm)
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        return
 
-            else:
-                blink_armed  = False
-                was_closed   = False
-                prev_nose_xy = None
-                cv2.putText(frame, "Face not detected", (10, 145),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                    if now - last_send >= (1.0 / EYE_SEND_HZ):
+                        payload = {
+                            "type":      "eye_metrics",
+                            "data":      _sanitize_metrics(send_metrics),
+                            "timestamp": now,
+                        }
+                        try:
+                            await ws.send(json.dumps(payload))
+                        except Exception as e:
+                            print(f"[camera_client] send error: {e}")
+                        last_send = now
 
-            win.prune(now, WINDOW_SEC)
+                    await asyncio.sleep(0)
 
-            blink_rate = win.blink_rate_per_min()
-            perclos    = win.perclos()
-            head_var   = win.head_motion_var()
-
-            # low_blink_rate: 1.0 when blink_rate == 0, falls linearly to 0.0 at
-            # LOW_BLINK_THRESH. The outer condition already guarantees the value
-            # is in [0, 1), so np.clip is not needed but kept for safety.
-            low_blink_rate = 1.0 - (blink_rate / LOW_BLINK_THRESH) if blink_rate < LOW_BLINK_THRESH else 0.0
-
-            current_eye_metrics = {
-                "blink_rate_per_min": blink_rate,
-                "low_blink_rate":     low_blink_rate,
-                "perclos":            perclos,
-                "head_motion_var":    head_var,
-                "pupil_delta":        pupil_delta,
-                "ear":                ear,
-                "ear_thresh":         ear_thresh,
-                "face_detected":      face_detected,
-                "window_sec":         WINDOW_SEC,
-                "camera_index":       CAMERA_INDEX,
-            }
-
-            if face_detected:
-                last_valid_eye_metrics = current_eye_metrics
-
-            send_metrics = last_valid_eye_metrics if last_valid_eye_metrics else current_eye_metrics
-
-            color = stress_color(stress_state)
-
-            # Draw a semi-transparent dark background panel behind the HUD text
-            # so it's readable against any background colour.
-            overlay = frame.copy()
-            cv2.rectangle(overlay, (10, 10), (130, 125), (0, 0, 0), -1)
-            cv2.addWeighted(overlay, 0.45, frame, 0.55, 0, frame)
-
-            cv2.putText(frame, "STRESS",             (20, 35),  cv2.FONT_HERSHEY_DUPLEX, 0.5, (220, 220, 220), 1)
-            cv2.putText(frame, f"{stress_score:.0f}", (20, 78),  cv2.FONT_HERSHEY_DUPLEX, 1.5, color, 3)
-            cv2.putText(frame, stress_state.upper(),  (20, 112), cv2.FONT_HERSHEY_DUPLEX, 0.7, color, 2)
-            cv2.imshow("camera_client", frame)
-
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
-
-            if now - last_send >= (1.0 / SEND_HZ):
-                payload = {
-                    "type":      "eye_metrics",
-                    "data":      _sanitize_metrics(send_metrics),
-                    "timestamp": now,
-                }
-                try:
-                    await ws.send(json.dumps(payload))
-                except Exception as e:
-                    print(f"[camera_client] send error: {e}")
-                last_send = now
-
-            await asyncio.sleep(0)
+        except (websockets.exceptions.ConnectionClosedError,
+                websockets.exceptions.ConnectionClosedOK,
+                OSError) as e:
+            print(f"[camera_client] connection lost ({e}), retrying in {RETRY_DELAY}s...")
+            await asyncio.sleep(RETRY_DELAY)
 
 
 if __name__ == "__main__":
-    asyncio.run(camera_loop())
+    # SIGTERM (e.g. from a process manager) is treated like Ctrl+C so the
+    # finally block in camera_loop() always runs and releases the camera.
+    signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
+    try:
+        asyncio.run(camera_loop())
+    except KeyboardInterrupt:
+        pass

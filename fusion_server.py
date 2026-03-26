@@ -1,8 +1,11 @@
 import asyncio
 import json
 import time
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+
 import uvicorn
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+
+from config import FACE_ABSENT_DECAY_RATE, FACE_ABSENT_FREEZE_SEC, SERVER_PORT
 
 app = FastAPI()
 
@@ -77,10 +80,7 @@ async def broadcast(payload: dict):
         subscribers.discard(ws)
 
 
-# How long the face must be absent before the score starts decaying toward neutral.
-FACE_ABSENT_FREEZE_SEC = 10.0
-# Decay rate: points per second the score moves toward 50 after the freeze window.
-FACE_ABSENT_DECAY_RATE = 1.0
+# FACE_ABSENT_FREEZE_SEC and FACE_ABSENT_DECAY_RATE are loaded from config.py
 
 
 def _process_message(msg: dict):
@@ -226,4 +226,4 @@ async def subscribe_endpoint(ws: WebSocket):
 
 
 if __name__ == "__main__":
-    uvicorn.run("fusion_server:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("fusion_server:app", host="0.0.0.0", port=SERVER_PORT, reload=True)

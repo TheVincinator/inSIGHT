@@ -1,7 +1,10 @@
-import time
 import threading
+import time
+
 import numpy as np
 from pynput import keyboard, mouse
+
+from config import KB_IDLE_THRESHOLD, KB_SLIDE_INTERVAL, KB_WINDOW_SIZE
 
 # =========================
 # GLOBAL STATE
@@ -17,9 +20,9 @@ _last_mouse_pos  = None
 _last_mouse_time = None
 _pre_click_dwell = 0.0
 
-WINDOW_SIZE      = 30
-SLIDE_INTERVAL   = 5
-IDLE_THRESHOLD   = 3.0
+WINDOW_SIZE      = KB_WINDOW_SIZE
+SLIDE_INTERVAL   = KB_SLIDE_INTERVAL
+IDLE_THRESHOLD   = KB_IDLE_THRESHOLD
 _prev_window_last_key_time = None
 _latest_keyboard_score     = None  # raw score, no smoothing — fusion_server handles that
 
@@ -328,9 +331,9 @@ def _take_snapshot():
         ms_snapshot = list(ms_window)
         sc_snapshot = list(sc_window)
 
-    prev_last = _prev_window_last_key_time
-    if kb_snapshot:
-        _prev_window_last_key_time = kb_snapshot[-1]["time"]
+        prev_last = _prev_window_last_key_time
+        if kb_snapshot:
+            _prev_window_last_key_time = kb_snapshot[-1]["time"]
 
     return kb_snapshot, ms_snapshot, sc_snapshot, prev_last
 
