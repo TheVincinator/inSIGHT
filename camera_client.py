@@ -19,11 +19,14 @@ import websockets
 from config import (
     CAM_HEIGHT, CAM_WIDTH, CAMERA_INDEX,
     EAR_BASELINE_SEC, EAR_FALLBACK_THRESH, EAR_THRESH_FRAC,
-    ESP32_SERVO_URL, EYE_EYE_SEND_HZ, EYE_EYE_WINDOW_SEC,
+    ESP32_SERVO_URL, EYE_SEND_HZ, EYE_WINDOW_SEC,
     LOW_BLINK_THRESH, RETRY_DELAY,
-    SERVO_ALPHA, SERVO_SERVO_DEAD_ZONE, SERVO_GAIN, SERVO_EYE_SEND_HZ,
+    RPPG_ASSUMED_FPS, RPPG_ENABLED, RPPG_HR_MAX_BPM, RPPG_HR_MIN_BPM,
+    RPPG_MIN_WINDOW_SEC, RPPG_RESET_ABSENT_SEC, RPPG_WINDOW_SEC,
+    SERVO_ALPHA, SERVO_DEAD_ZONE, SERVO_GAIN, SERVO_SEND_HZ,
     WS_INGEST_URL, WS_SUBSCRIBE_URL,
 )
+from rppg import RPPGEstimator
 
 # ---- Audio alert setup ----
 # On each stress trigger: plays stress_alert.wav first, waits for it to finish,
@@ -152,7 +155,7 @@ def iris_diameter_px(landmarks, iris_idx, eye_outer_idx, eye_inner_idx, w, h):
     """
     iris   = _pt(landmarks, iris_idx, w, h)
     outer  = _pt(landmarks, eye_outer_idx, w, h)
-    inner  = _pt(landmarks, eye_inner_idx, w, h)   # was never assigned before — NameError bug
+    inner  = _pt(landmarks, eye_inner_idx, w, h)
     eye_w  = np.linalg.norm(outer - inner) + 1e-6
     return float(np.linalg.norm(iris - outer) / eye_w)
 
@@ -289,6 +292,15 @@ async def _camera_loop_inner(cap):
 
     prev_nose_xy = None
 
+    rppg = RPPGEstimator(
+        window_sec=RPPG_WINDOW_SEC,
+        assumed_fps=RPPG_ASSUMED_FPS,
+        hr_min_bpm=RPPG_HR_MIN_BPM,
+        hr_max_bpm=RPPG_HR_MAX_BPM,
+        min_window_sec=RPPG_MIN_WINDOW_SEC,
+    ) if RPPG_ENABLED else None
+    rppg_face_absent_since: float | None = None
+
     while True:  # reconnect loop
         try:
             async with websockets.connect(WS_INGEST_URL) as ws, \
@@ -370,7 +382,7 @@ async def _camera_loop_inner(cap):
                         target_speed   = SERVO_GAIN * face_error
                         servo_filtered = SERVO_ALPHA * target_speed + (1 - SERVO_ALPHA) * servo_filtered
 
-                        if face_error != 0.0 and (now - last_servo_send) > (1.0 / SERVO_EYE_SEND_HZ):
+                        if face_error != 0.0 and (now - last_servo_send) > (1.0 / SERVO_SEND_HZ):
                             send_servo_command(servo_filtered)
                             last_servo_send = now
 
@@ -392,12 +404,24 @@ async def _camera_loop_inner(cap):
 
                         win.add(now, is_closed, blink_event, motion_norm)
 
+                        # --- rPPG heart rate ---
+                        if rppg is not None:
+                            rppg.push_frame(frame, lms, w, h, now)
+                            rppg_face_absent_since = None
+
                     else:
                         blink_armed  = False
                         was_closed   = False
                         prev_nose_xy = None
                         cv2.putText(frame, "Face not detected", (10, 145),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+                        if rppg is not None:
+                            if rppg_face_absent_since is None:
+                                rppg_face_absent_since = now
+                            elif now - rppg_face_absent_since >= RPPG_RESET_ABSENT_SEC:
+                                rppg.reset()
+                                rppg_face_absent_since = None
 
                     win.prune(now, EYE_WINDOW_SEC)
 
@@ -421,6 +445,8 @@ async def _camera_loop_inner(cap):
                         "face_detected":      face_detected,
                         "window_sec":         EYE_WINDOW_SEC,
                         "camera_index":       CAMERA_INDEX,
+                        "hr_bpm":             rppg.hr_bpm        if rppg else None,
+                        "hr_quality":         rppg.signal_quality if rppg else 0.0,
                     }
 
                     if face_detected:
@@ -433,12 +459,19 @@ async def _camera_loop_inner(cap):
                     # Draw a semi-transparent dark background panel behind the HUD text
                     # so it's readable against any background colour.
                     overlay = frame.copy()
-                    cv2.rectangle(overlay, (10, 10), (130, 125), (0, 0, 0), -1)
+                    cv2.rectangle(overlay, (10, 10), (160, 165), (0, 0, 0), -1)
                     cv2.addWeighted(overlay, 0.45, frame, 0.55, 0, frame)
 
                     cv2.putText(frame, "STRESS",             (20, 35),  cv2.FONT_HERSHEY_DUPLEX, 0.5, (220, 220, 220), 1)
                     cv2.putText(frame, f"{stress_score:.0f}", (20, 78),  cv2.FONT_HERSHEY_DUPLEX, 1.5, color, 3)
                     cv2.putText(frame, stress_state.upper(),  (20, 112), cv2.FONT_HERSHEY_DUPLEX, 0.7, color, 2)
+
+                    hr_bpm_display = send_metrics.get("hr_bpm")
+                    if hr_bpm_display:
+                        cv2.putText(frame, "HR",                    (20, 140), cv2.FONT_HERSHEY_DUPLEX, 0.5, (200, 200, 200), 1)
+                        cv2.putText(frame, f"{hr_bpm_display:.0f} bpm", (20, 160), cv2.FONT_HERSHEY_DUPLEX, 0.6, (200, 200, 200), 1)
+                    else:
+                        cv2.putText(frame, "HR: --",                (20, 155), cv2.FONT_HERSHEY_DUPLEX, 0.5, (120, 120, 120), 1)
                     cv2.imshow("camera_client", frame)
 
                     if cv2.waitKey(1) & 0xFF == ord("q"):

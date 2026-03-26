@@ -5,7 +5,10 @@ import time
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
-from config import FACE_ABSENT_DECAY_RATE, FACE_ABSENT_FREEZE_SEC, SERVER_PORT
+from config import (
+    FACE_ABSENT_DECAY_RATE, FACE_ABSENT_FREEZE_SEC, SERVER_PORT,
+    RPPG_HR_BASELINE, RPPG_HR_RANGE, RPPG_HR_WEIGHT, RPPG_MIN_QUALITY_GATE,
+)
 
 app = FastAPI()
 
@@ -14,6 +17,8 @@ class FusionState:
     def __init__(self):
         self.eye_metrics     = None
         self.keyboard_load   = None
+        self.hr_bpm:     float | None = None
+        self.hr_quality: float        = 0.0
         self.smoothed_stress = 50.0  # persistent smoothed output
         self.face_absent_since: float | None = None  # timestamp when face was last lost
 
@@ -59,11 +64,21 @@ def fuse(state: FusionState) -> float:
     eye_effect = 0.0
     blink_high_diff = max(0.0, blink_rate - 40.0)
     eye_effect += (blink_high_diff ** 1.3) * 0.07
-    eye_effect += low_blink_rate * 12.0
-    eye_effect += perclos * 32.0
-    eye_effect += max(0.0, pupil_delta) * 18.0
+    eye_effect += low_blink_rate * 19.0   # strong, reliable cognitive load marker
+    eye_effect += perclos * 12.0          # reduced: PERCLOS is fatigue-specific, not cognitive load
+    eye_effect += max(0.0, pupil_delta) * 24.0  # gold standard for cognitive load
 
-    stress = 50.0 + eye_effect + kb_effect
+    # ---- rPPG heart rate contribution ----
+    # Gated by signal quality so that noisy/absent HR has zero effect.
+    hr_bpm     = state.hr_bpm
+    hr_quality = state.hr_quality
+    if hr_bpm and hr_quality >= RPPG_MIN_QUALITY_GATE:
+        hr_norm   = max(-1.0, min(1.0, (hr_bpm - RPPG_HR_BASELINE) / RPPG_HR_RANGE))
+        hr_effect = hr_norm * RPPG_HR_WEIGHT
+    else:
+        hr_effect = 0.0
+
+    stress = 50.0 + eye_effect + kb_effect + hr_effect
     return float(max(0.0, min(100.0, stress)))
 
 
@@ -101,7 +116,11 @@ def _process_message(msg: dict):
     msg_type = msg.get("type")
 
     if msg_type == "eye_metrics":
-        state.eye_metrics = msg.get("value") or msg.get("data")
+        data              = msg.get("value") or msg.get("data") or {}
+        state.eye_metrics = data
+        if isinstance(data, dict):
+            state.hr_bpm     = data.get("hr_bpm") or None
+            state.hr_quality = float(data.get("hr_quality") or 0.0)
 
     elif msg_type == "keyboard_load":
         val = msg.get("value")
@@ -164,6 +183,8 @@ def _process_message(msg: dict):
     print("eye ► pupil Δ :", round(eye.get("pupil_delta", 0.0), 3))
     print("eye ► EAR     :", round(eye.get("ear", 0.0) or 0.0, 3),
           "| thresh:", round(eye.get("ear_thresh", 0.0) or 0.0, 3))
+    print("rPPG ► HR     :", round(state.hr_bpm or 0.0, 1), "bpm",
+          "| quality:", round(state.hr_quality or 0.0, 3))
     print("stress_score  :", round(stress_score, 1), "| state:", label)
 
     return {"type": "stress_score", "value": stress_score, "state": label}

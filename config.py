@@ -41,3 +41,18 @@ KB_IDLE_THRESHOLD = 3.0  # gap (seconds) between events that counts as idle time
 # ── Fusion server ─────────────────────────────────────────────────────────────
 FACE_ABSENT_FREEZE_SEC = 10.0   # hold score constant for this long after face disappears
 FACE_ABSENT_DECAY_RATE = 1.0    # points/update the score decays toward 50 after freeze
+
+# ── rPPG (Remote Photoplethysmography) ────────────────────────────────────────
+RPPG_ENABLED          = True    # set False to disable without touching other code
+RPPG_WINDOW_SEC       = 10.0   # seconds of RGB history used for each FFT
+RPPG_MIN_WINDOW_SEC   = 5.0    # minimum seconds before an estimate is emitted
+RPPG_ASSUMED_FPS      = 25.0   # starting fps estimate; auto-refined from timestamps
+RPPG_HR_MIN_BPM       = 45.0   # lower bound of FFT search band
+RPPG_HR_MAX_BPM       = 180.0  # upper bound of FFT search band
+RPPG_RESET_ABSENT_SEC = 3.0    # seconds of face absence before buffer is cleared
+
+# Fusion parameters for the HR contribution to the stress score
+RPPG_HR_BASELINE      = 72.0   # bpm considered "neutral" resting HR
+RPPG_HR_RANGE         = 30.0   # bpm deviation that saturates the normalised HR signal
+RPPG_HR_WEIGHT        = 10.0   # max ±points the HR signal contributes to the stress score
+RPPG_MIN_QUALITY_GATE = 0.25   # signal quality threshold below which HR is ignored
